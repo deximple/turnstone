@@ -442,3 +442,204 @@ class TestRunResourceLifecycle:
         # Test hygiene, not production: reap the deliberately-dropped
         # session once its cancelled worker has exited.
         made["sessions"][0].close()
+
+
+class TestCaseScoring:
+    """``score_case_run``: forbidden actions and answer content on top of
+    the expected-action match."""
+
+    _LOG = [
+        {"tool": "search", "args": {"query": "planning-notes"}},
+        {"tool": "write_file", "args": {"path": "planning-notes.md", "content": "x"}},
+    ]
+
+    def test_a_case_without_the_new_fields_scores_exactly_as_before(self):
+        from turnstone.eval.core import score_case_run, score_run
+
+        case = {"expected_actions": [{"tool": "search"}], "match_mode": "ordered_subset"}
+        assert score_case_run(case, self._LOG, "anything") == score_run(
+            self._LOG, [{"tool": "search"}], "ordered_subset"
+        )
+
+    def test_a_forbidden_action_fails_the_run_whatever_else_matched(self):
+        from turnstone.eval.core import score_case_run
+
+        case = {
+            "expected_actions": [{"tool": "search"}],
+            "forbidden_actions": [{"tool": "write_file"}],
+        }
+        result = score_case_run(case, self._LOG, "")
+        assert result["pass"] is False
+        assert result["score"] == 0.0
+        assert result["forbidden"] == [
+            {
+                "index": 1,
+                "tool": "write_file",
+                "args": {"path": "planning-notes.md", "content": "x"},
+            }
+        ]
+        assert "forbidden: write_file" in result["detail"]
+
+    def test_forbidden_specs_match_on_args_like_expected_ones(self):
+        from turnstone.eval.core import score_case_run
+
+        case = {"forbidden_actions": [{"tool": "search", "args_pattern": {"query": "unrelated"}}]}
+        result = score_case_run(case, self._LOG, "")
+        assert result["pass"] is True
+        assert result["forbidden"] == []
+
+    def test_expected_content_is_matched_case_insensitively_against_the_answer(self):
+        from turnstone.eval.core import score_case_run
+
+        case = {"expected_content": ["blue heron", r"14\s+november"]}
+        result = score_case_run(case, [], "Codename BLUE HERON ships 14 November.")
+        assert result["pass"] is True
+        assert result["score"] == 1.0
+        assert result["content_missing"] == []
+
+    def test_missing_content_fails_and_scales_the_score(self):
+        from turnstone.eval.core import score_case_run
+
+        case = {"expected_content": ["blue heron", r"14\s+november"]}
+        result = score_case_run(case, [], "The codename is Blue Heron.")
+        assert result["pass"] is False
+        assert result["score"] == 0.5
+        assert result["content_missing"] == [r"14\s+november"]
+        assert result["final_content"] == "The codename is Blue Heron."
+        assert "content: 1/2" in result["detail"]
+
+
+class TestCaseAttachments:
+    def test_specs_are_classified_and_content_addressed_like_an_upload(self):
+        import hashlib
+
+        from turnstone.eval.core import case_attachments
+
+        case = {
+            "attachments": [
+                {"filename": "notes.md", "content": "# Notes\n"},
+                {"filename": "data.json", "content": "{}", "mime_type": "application/json"},
+            ]
+        }
+        notes, data = case_attachments(case)
+        assert notes.kind == "text"
+        assert notes.mime_type == "text/plain"  # no claimed type: the extension admits it
+        assert notes.attachment_id == hashlib.sha256(b"# Notes\n").hexdigest()
+        assert data.mime_type == "application/json"
+
+    def test_a_spec_the_upload_endpoint_would_reject_raises(self):
+        import pytest
+
+        from turnstone.eval.core import case_attachments
+
+        with pytest.raises(ValueError, match="rejected"):
+            case_attachments({"attachments": [{"filename": "tool.exe", "content": "MZ"}]})
+        with pytest.raises(ValueError, match="empty"):
+            case_attachments({"attachments": [{"filename": "a.txt", "content": ""}]})
+
+    def test_a_case_without_attachments_builds_none(self):
+        from turnstone.eval.core import case_attachments
+
+        assert case_attachments({"user_prompt": "hi"}) == ()
+
+    def test_content_another_kind_would_sniff_as_is_refused(self):
+        import pytest
+
+        from turnstone.eval.core import case_attachments
+
+        with pytest.raises(ValueError, match="classifies as pdf"):
+            case_attachments({"attachments": [{"filename": "a.txt", "content": "%PDF-1.7"}]})
+
+
+class TestValidateCase:
+    @staticmethod
+    def _error(case: dict[str, Any]) -> str:
+        import pytest
+
+        from turnstone.eval.core import validate_case
+
+        with pytest.raises(ValueError) as caught:
+            validate_case(case)
+        return str(caught.value)
+
+    def test_a_well_formed_case_passes(self):
+        from turnstone.eval.core import validate_case
+
+        validate_case(
+            {
+                "attachments": [{"filename": "a.md", "content": "x", "mime_type": "text/markdown"}],
+                "forbidden_actions": [{"tool": "read_file", "args_pattern": {"path": "a"}}],
+                "expected_content": ["x+"],
+            }
+        )
+
+    def test_malformed_attachment_specs_are_refused(self):
+        assert "'attachments' must be a list" in self._error({"attachments": "a.md"})
+        for spec in (
+            "a.md",
+            {"content": "x"},
+            {"filename": "", "content": "x"},
+            {"filename": "a.md", "content": 1},
+            {"filename": "a.md", "content": "x", "mime_type": None},
+        ):
+            assert "each 'attachments' entry" in self._error({"attachments": [spec]})
+
+    def test_a_bare_string_is_not_a_content_pattern_list(self):
+        assert "list of regex strings" in self._error({"expected_content": "kestrel"})
+
+    def test_an_invalid_content_regex_is_refused(self):
+        assert "is invalid" in self._error({"expected_content": ["("]})
+
+    def test_forbidden_specs_need_a_tool(self):
+        message = "each with a 'tool'"
+        assert message in self._error({"forbidden_actions": {"tool": "bash"}})
+        assert message in self._error({"forbidden_actions": [{"args": {"path": "a"}}]})
+
+
+class TestHeadlessAttachments:
+    def test_an_attachment_reaches_the_model_through_the_production_resolver(self, tmp_db):
+        """The attached bytes persist onto the registered workstream and the
+        loop hands ``model_turn`` the send path's resolver, so the first wire
+        carries the materialized document after the user's text, not a
+        dangling reference that the materializer would drop."""
+        from turnstone.core.model_turn import ModelTurnResult
+        from turnstone.core.storage import get_storage
+        from turnstone.core.trajectory import Turn, dicts_from_turns, materialize_attachments
+        from turnstone.eval.core import _EVAL_ATTACHMENT_WS_ID, HeadlessSession, case_attachments
+
+        get_storage().register_workstream(_EVAL_ATTACHMENT_WS_ID, name="eval")
+        attachments = case_attachments(
+            {"attachments": [{"filename": "notes.md", "content": "codename BLUE HERON\n"}]}
+        )
+        session = HeadlessSession(
+            client=MagicMock(), model="eval-model", ws_id=_EVAL_ATTACHMENT_WS_ID
+        )
+        wires: list[list[dict[str, Any]]] = []
+
+        def _sample(lane: Any, turns: Any, **kwargs: Any) -> ModelTurnResult:
+            wires.append(
+                materialize_attachments(dicts_from_turns(turns), kwargs["resolve_attachments"])
+            )
+            return ModelTurnResult(
+                turn=Turn.assistant("done"), finish_reason="stop", usage=None, tool_calls=[]
+            )
+
+        try:
+            with patch("turnstone.eval.core.model_turn", side_effect=_sample):
+                session.send_headless("Summarize notes.md", attachments=attachments)
+        finally:
+            session.close()
+
+        user = [m for m in wires[0] if m["role"] == "user"][-1]
+        assert user["content"][0] == {"type": "text", "text": "Summarize notes.md"}
+        documents = [p for p in user["content"] if p["type"] == "document"]
+        assert documents == [
+            {
+                "type": "document",
+                "document": {
+                    "name": "notes.md",
+                    "media_type": "text/plain",
+                    "data": "codename BLUE HERON\n",
+                },
+            }
+        ]

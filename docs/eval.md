@@ -80,6 +80,9 @@ Test suites are JSON files with this structure:
 | `user_prompt`      | yes      | --                 | The message sent to the model. |
 | `setup.files`      | no       | `{}`               | Files to create in the temp directory before running. Keys are relative paths, values are file content. |
 | `expected_actions`  | no       | `[]`               | List of expected tool calls to match against. |
+| `forbidden_actions` | no      | `[]`               | Action specs (same shape as `expected_actions`) the model must never take; any match fails the run with score 0. |
+| `expected_content` | no       | `[]`               | List of regexes (case-insensitive) the final answer must match. |
+| `attachments`      | no       | `[]`               | Text files attached to the prompt: `{"filename", "content", "mime_type"}` objects (`mime_type` optional). They are classified and sent as an upload would be. |
 | `match_mode`       | no       | `"ordered_subset"` | How to match actual vs expected actions (see Scoring). |
 | `max_turns`        | no       | `10`               | Maximum conversation turns before stopping. |
 | `n_runs`           | no       | suite default or 3 | Per-case override for number of runs. |
@@ -129,6 +132,16 @@ A single actual tool call matches an expected action when:
 - **Pass** = score equals 1.0 (all expected actions matched).
 - The return dict includes: `pass`, `score`, `matched` (indices), `unmatched`
   (indices), `extra_tools`, and `detail` (human-readable summary).
+
+The harness scores each run with `score_case_run()`, which applies the case's
+optional `forbidden_actions` and `expected_content` on top of `score_run()`.
+A forbidden match sets the score to 0 and lists the offending calls under
+`forbidden`. Missing content patterns fail the run, scale the score by the
+fraction found, and are listed under `content_missing` next to the start of
+the answer (`final_content`). A case with neither field scores exactly as
+`score_run()` does. `eval_attachments.json` uses both: its cases attach a file
+the workspace lacks, forbid looking for it or writing it, and check the answer
+for a fact only the attachment holds.
 
 ### JSON Dump Detection
 

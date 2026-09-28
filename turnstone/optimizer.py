@@ -48,6 +48,7 @@ from turnstone.eval.core import (
     _make_client_and_provider,
     _print_summary_table,
     _run_iteration,
+    validate_case,
 )
 
 
@@ -1265,6 +1266,10 @@ def run_optimization(
             raise SystemExit(f"Test case {i} missing required 'id' field")
         if "user_prompt" not in case:
             raise SystemExit(f"Test case '{case.get('id', i)}' missing 'user_prompt'")
+        try:
+            validate_case(case)
+        except ValueError as e:
+            raise SystemExit(f"Test case '{case['id']}': {e}") from None
     defaults = suite.get("defaults", {})
     # Precedence: CLI arg (non-None) > tests.json defaults > code default (3)
     resolved_n_runs: int = n_runs if n_runs is not None else int(defaults.get("n_runs", 3))

@@ -28,6 +28,7 @@ from turnstone.eval.core import (
     _print_summary_table,
     _run_iteration,
     run_skill_adherence,
+    validate_case,
 )
 
 
@@ -349,6 +350,10 @@ def main() -> None:
             raise SystemExit(f"Test case {i} missing required 'id' field")
         if "user_prompt" not in case:
             raise SystemExit(f"Test case '{case.get('id', i)}' missing 'user_prompt'")
+        try:
+            validate_case(case)
+        except ValueError as e:
+            raise SystemExit(f"Test case '{case['id']}': {e}") from None
     defaults = suite.get("defaults", {})
     # Precedence: CLI arg (non-None) > tests.json defaults > code default (3)
     resolved_n_runs: int = (

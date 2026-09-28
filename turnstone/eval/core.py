@@ -16,6 +16,8 @@ module; this module never imports from the optimizer.
 
 import contextlib
 import copy
+import functools
+import hashlib
 import json
 import math
 import os
@@ -25,13 +27,14 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any
 
 from openai import OpenAI
 
+from turnstone.core.attachments import Attachment, classify_upload
 from turnstone.core.model_turn import cap_tool_calls, model_turn, require_lane_capabilities
 from turnstone.core.providers import LLMProvider, create_client, create_provider
 from turnstone.core.session import ChatSession
@@ -46,6 +49,86 @@ TOOLS = INTERACTIVE_TOOLS
 
 # Tools that require MCP servers — excluded from headless eval
 _MCP_ONLY_TOOLS = frozenset({"read_resource", "use_prompt"})
+
+# Workstream row a case's attachments persist onto.  The conversation writer
+# discards rows (attachment blobs included) for an unregistered workstream, and
+# the wire resolver then drops the unresolved reference, so the model would see
+# the prompt without its attachment.
+_EVAL_ATTACHMENT_WS_ID = "eval-attachments"
+
+
+def case_attachments(case: dict[str, Any]) -> tuple[Attachment, ...]:
+    """Build a case's ``attachments`` specs into the attachments a send carries.
+
+    Each spec is ``{"filename": ..., "content": ..., "mime_type": ...}`` with
+    ``mime_type`` optional (the browser-claimed type).  Classification is the
+    upload endpoint's own, and the id is the content hash the upload buffer
+    assigns, so the attachment reaches the model exactly as an uploaded file
+    with those bytes would.  Text content only: a spec the upload endpoint
+    would reject, or classify as another kind, raises ``ValueError``.
+    """
+    specs = case.get("attachments") or []
+    if not isinstance(specs, list):
+        raise ValueError("'attachments' must be a list")
+    built: list[Attachment] = []
+    for spec in specs:
+        if (
+            not isinstance(spec, dict)
+            or not isinstance(spec.get("filename"), str)
+            or not spec["filename"]
+            or not isinstance(spec.get("content"), str)
+            or not isinstance(spec.get("mime_type", ""), str)
+        ):
+            raise ValueError(
+                "each 'attachments' entry must be an object with a non-empty 'filename', "
+                "a string 'content' and an optional string 'mime_type'"
+            )
+        filename = spec["filename"]
+        data = spec["content"].encode("utf-8")
+        if not data:
+            raise ValueError(f"attachment {filename!r} has empty content")
+        kind, mime, rejection = classify_upload(filename, spec.get("mime_type", ""), data)
+        if rejection is not None:
+            raise ValueError(f"attachment {filename!r} rejected: {rejection.message}")
+        assert kind is not None and mime is not None  # success ⟹ both set
+        if kind != "text":
+            raise ValueError(
+                f"attachment {filename!r} classifies as {kind}; only text is supported"
+            )
+        built.append(
+            Attachment(
+                attachment_id=hashlib.sha256(data).hexdigest(),
+                filename=filename,
+                mime_type=mime,
+                kind=kind,
+                content=data,
+            )
+        )
+    return tuple(built)
+
+
+def validate_case(case: dict[str, Any]) -> None:
+    """Raise ``ValueError`` when a case's attachments or scoring fields are malformed.
+
+    Suite loaders call this before any run, so a bad spec stops the sweep at
+    startup instead of scoring every run as an error.  A bare string where a
+    list belongs is refused: ``expected_content: "kestrel"`` would otherwise be
+    read one character at a time and pass almost any answer.
+    """
+    case_attachments(case)
+    forbidden = case.get("forbidden_actions", [])
+    if not isinstance(forbidden, list) or not all(
+        isinstance(spec, dict) and isinstance(spec.get("tool"), str) for spec in forbidden
+    ):
+        raise ValueError("'forbidden_actions' must be a list of action specs, each with a 'tool'")
+    patterns = case.get("expected_content", [])
+    if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
+        raise ValueError("'expected_content' must be a list of regex strings")
+    for pattern in patterns:
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            raise ValueError(f"'expected_content' pattern {pattern!r} is invalid: {e}") from None
 
 
 # ─── Provider auto-detection ──────────────────────────────────────────────────
@@ -304,18 +387,27 @@ class HeadlessSession(ChatSession):
         max_turns: int = 10,
         verbose: bool = False,
         log_prefix: str = "",
+        attachments: Sequence[Attachment] = (),
     ) -> list[dict[str, Any]]:
         """Run a complete conversation turn headlessly.
 
         Drains production streaming provider calls into single-shot results.
         Captures all tool calls into ``self.tool_call_log``.
 
+        ``attachments`` ride the production user-turn path: the bytes persist
+        content-addressed (the session's workstream must be registered) and
+        the turn carries by-reference parts that the loop's resolver
+        materializes for the lane, as an uploaded file reaches the wire.
+
         Returns the tool call log: list of dicts with keys:
             tool: str, args: dict, result: str (truncated), ok: bool,
             turn: int
         """
-        self.messages.append(Turn.user(user_input))
-        self._msg_tokens.append(max(1, int(len(user_input) / self._chars_per_token)))
+        if attachments:
+            self._append_user_turn(user_input, tuple(attachments))
+        else:
+            self.messages.append(Turn.user(user_input))
+            self._msg_tokens.append(max(1, int(len(user_input) / self._chars_per_token)))
         return self._run_headless_loop(max_turns=max_turns, verbose=verbose, log_prefix=log_prefix)
 
     def _run_headless_loop(
@@ -379,6 +471,9 @@ class HeadlessSession(ChatSession):
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
                 reasoning_effort=self.reasoning_effort,
+                # By-reference attachment parts expand to the inline parts this
+                # lane's capabilities call for, via the send path's resolver.
+                resolve_attachments=functools.partial(self._resolve_attachments, caps=lane_caps),
             )
             elapsed = time.monotonic() - t0
 
@@ -698,11 +793,14 @@ def _run_single_test(
     out is the one exception, and it opts out inside the helper.
     """
     state: dict[str, Any] = {}
+    attachments = case_attachments(case)
 
     def _setup(workdir: str) -> None:
         eval_db = os.path.join(workdir, ".turnstone_eval.db")
         reset_storage()
         init_storage("sqlite", path=eval_db, run_migrations=False)
+        if attachments:
+            get_storage().register_workstream(_EVAL_ATTACHMENT_WS_ID, name="eval")
         state["t0"] = time.monotonic()
         # Write setup files
         setup_files = list(case.get("setup", {}).get("files", {}).items())
@@ -760,6 +858,7 @@ def _run_single_test(
             context_window=context_window,
             tool_truncation=2000,
             tool_overrides=tool_overrides,
+            ws_id=_EVAL_ATTACHMENT_WS_ID if attachments else None,
         )
         if skill_mode and skill is not None:
             # Activate the seeded skill via the production path:
@@ -774,6 +873,7 @@ def _run_single_test(
                 max_turns=max_turns,
                 verbose=verbose,
                 log_prefix=log_prefix,
+                attachments=attachments,
             )
 
         return session, _drive
@@ -855,10 +955,10 @@ def _run_and_score_with(
             skill_mode=params.get("skill_mode", False),
         )
 
-        score_result = score_run(
-            tool_log=run_result["tool_log"],
-            expected_actions=case.get("expected_actions", []),
-            match_mode=case.get("match_mode", "ordered_subset"),
+        score_result = score_case_run(
+            case,
+            run_result["tool_log"],
+            run_result.get("final_content") or "",
         )
 
         score_result["tool_sequence"] = [t["tool"] for t in run_result["tool_log"]]
@@ -1046,6 +1146,61 @@ def score_run(
             "extra_tools": [],
             "detail": f"Unknown match_mode: {match_mode}",
         }
+
+
+def score_case_run(
+    case: dict[str, Any],
+    tool_log: list[dict[str, Any]],
+    final_content: str,
+) -> dict[str, Any]:
+    """Score one run against every expectation its case declares.
+
+    ``expected_actions`` are scored by :func:`score_run`.  Two optional fields
+    add checks that tool-sequence matching cannot express:
+
+    * ``forbidden_actions`` — action specs (the ``expected_actions`` shape)
+      the model must never take.  Any match fails the run with score 0,
+      whatever else it did.
+    * ``expected_content`` — regexes (case-insensitive) the final answer must
+      match, for a case whose answer depends on information only its input
+      carries, such as an attachment.  The score scales by the fraction found.
+
+    A case declaring neither gets :func:`score_run`'s result unchanged.
+    """
+    result = score_run(
+        tool_log=tool_log,
+        expected_actions=case.get("expected_actions", []),
+        match_mode=case.get("match_mode", "ordered_subset"),
+    )
+    forbidden_specs = case.get("forbidden_actions") or []
+    patterns = case.get("expected_content") or []
+    if not forbidden_specs and not patterns:
+        return result
+    notes: list[str] = []
+    score = result["score"]
+    forbidden = [
+        {"index": i, "tool": action["tool"], "args": action["args"]}
+        for i, action in enumerate(tool_log)
+        if any(_match_action(action, spec) for spec in forbidden_specs)
+    ]
+    if forbidden_specs:
+        result["forbidden"] = forbidden
+        if forbidden:
+            score = 0.0
+            notes.append("forbidden: " + ", ".join(f["tool"] for f in forbidden))
+    missing = [p for p in patterns if not re.search(p, final_content, re.IGNORECASE)]
+    if patterns:
+        result["content_missing"] = missing
+        result["final_content"] = final_content[:500]
+        found = len(patterns) - len(missing)
+        score *= found / len(patterns)
+        if missing:
+            notes.append(f"content: {found}/{len(patterns)}")
+    result["score"] = score
+    result["pass"] = result["pass"] and not forbidden and not missing
+    if notes:
+        result["detail"] += "; " + "; ".join(notes)
+    return result
 
 
 # ─── Iteration runner ────────────────────────────────────────────────────────
@@ -1339,10 +1494,10 @@ def _run_iteration(
                     skill_mode=skill_mode,
                 )
 
-                score_result = score_run(
-                    tool_log=run_result["tool_log"],
-                    expected_actions=case.get("expected_actions", []),
-                    match_mode=case.get("match_mode", "ordered_subset"),
+                score_result = score_case_run(
+                    case,
+                    run_result["tool_log"],
+                    run_result.get("final_content") or "",
                 )
 
                 score_result["tool_sequence"] = [t["tool"] for t in run_result["tool_log"]]
