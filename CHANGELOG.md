@@ -22,6 +22,13 @@ frozen.
 
 ### Added
 
+- **Attachment cases in `turnstone-eval`.** A case can attach text files (`attachments` entries
+  with `filename`, `content` and an optional `mime_type`); each is classified like an upload and
+  sent through the real user-turn path, so the model receives exactly what an uploaded file
+  produces. `forbidden_actions` fails a run that makes any listed tool call, and
+  `expected_content` lists regexes the final answer must match. `eval_attachments.json` uses both
+  to measure whether a model answers from an attached or pasted file instead of looking for it on
+  disk.
 - **Anthropic workspace scoping per model definition.** An organization-level Anthropic API key
   in a multi-workspace organization needs the `anthropic-workspace-id` header on every request.
   The model editor gains a Workspace ID field for the `anthropic` and `anthropic-compatible`
@@ -72,6 +79,14 @@ frozen.
 
 ### Fixed
 
+- **Small models looking for an attached file on disk.** A text attachment reached the model as
+  a bare document block after the user's message, with nothing saying it was the file the user
+  named or that it was not in the workspace. Small local models answered "summarize notes.md" by
+  calling `read_file` on the name, searching the workspace, and reporting that the file does not
+  exist, and in chat offered to create it. Each attached text file (a long paste included) is now
+  introduced by a label naming it and saying attachments are not saved to disk, and `read_file`
+  on a missing path named like an attachment says the user attached that file and points at their
+  message instead of the filesystem.
 - **GPT-6 Sol and Luna requests built from generic defaults.** `gpt-6-sol` and `gpt-6-luna` had no
   capability rows and fell through to the default OpenAI row: a configured reasoning effort was
   dropped, a configured temperature was sent while reasoning ran at the server default, which the
