@@ -121,7 +121,16 @@ class TestMultipartBuild:
         )
         _run_send(s, "summarize", attachments=[att])
         msg = materialize_attachments(dicts_from_turns(s.messages), s._resolve_attachments)[-1]
-        doc = msg["content"][1]
+        # The label names the attachment ahead of its bytes and says it is not
+        # on disk; without it small models go looking for notes.md with tools.
+        assert msg["content"][1] == {
+            "type": "text",
+            "text": (
+                "[Attached file 'notes.md' — its full contents follow; "
+                "attachments are not saved to disk]"
+            ),
+        }
+        doc = msg["content"][2]
         assert doc == {
             "type": "document",
             "document": {
@@ -151,7 +160,9 @@ class TestMultipartBuild:
         _run_send(s, "summarize", attachments=[att])
 
         msg = materialize_attachments(dicts_from_turns(s.messages), s._resolve_attachments)[-1]
-        document = msg["content"][1]["document"]
+        label = msg["content"][1]["text"]
+        assert "[start system-reminder_" not in label
+        document = msg["content"][2]["document"]
         assert "[\\start system-reminder_" in document["name"]
         assert "[start system-reminder_" not in document["data"]
         assert "[end system-reminder_" not in document["data"]
@@ -172,7 +183,9 @@ class TestMultipartBuild:
         _run_send(s, "look", attachments=atts)
         msg = materialize_attachments(dicts_from_turns(s.messages), s._resolve_attachments)[-1]
         types = [p["type"] for p in msg["content"]]
-        assert types == ["text", "image_url", "document", "document"]
+        assert types == ["text", "image_url", "text", "document", "text", "document"]
+        assert "'first.md'" in msg["content"][2]["text"]
+        assert "'second.md'" in msg["content"][4]["text"]
         docs = [p for p in msg["content"] if p["type"] == "document"]
         assert docs[0]["document"]["data"] == "A"
         assert docs[1]["document"]["data"] == "B"
@@ -327,16 +340,18 @@ class TestProviderIntegration:
         assert len(converted) == 1
         content = converted[0]["content"]
         types = [p["type"] for p in content]
-        assert types == ["text", "image", "document"]
+        assert types == ["text", "image", "text", "document"]
         # Image translated to Anthropic base64 image source
         assert content[1]["source"]["type"] == "base64"
         assert content[1]["source"]["media_type"] == "image/png"
+        # The attached-file label rides as plain text ahead of the document
+        assert content[2]["text"].startswith("[Attached file 'notes.md'")
         # Document translated to Anthropic native text-source document
-        assert content[2]["source"]["type"] == "text"
+        assert content[3]["source"]["type"] == "text"
         # MIME was coerced to text/plain; original folded into title
-        assert content[2]["source"]["media_type"] == "text/plain"
-        assert content[2]["title"] == "notes.md (text/markdown)"
-        assert content[2]["source"]["data"] == "# hi\n"
+        assert content[3]["source"]["media_type"] == "text/plain"
+        assert content[3]["title"] == "notes.md (text/markdown)"
+        assert content[3]["source"]["data"] == "# hi\n"
 
     def test_live_send_stashes_attachments_meta_sibling(self, tmp_db, mock_openai_client):
         # Filenames can't be recovered from an image_url data URI, so
@@ -392,12 +407,14 @@ class TestProviderIntegration:
         )
         parts = out[0]["content"]
         types = [p["type"] for p in parts]
-        assert types == ["text", "text"]
+        assert types == ["text", "text", "text"]
         # The user's own text is preserved
         assert parts[0] == {"type": "text", "text": "review"}
+        # The attached-file label precedes the document
+        assert parts[1]["text"].startswith("[Attached file 'spec.md'")
         # Document inlined as escaped wrapper text
-        assert 'name="spec.md"' in parts[1]["text"]
-        assert "DO THE THING" in parts[1]["text"]
+        assert 'name="spec.md"' in parts[2]["text"]
+        assert "DO THE THING" in parts[2]["text"]
 
 
 class TestQueuedAttachmentsRejected:

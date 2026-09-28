@@ -2838,6 +2838,81 @@ class TestExecReadImage:
         assert "<svg" in output  # Read as text
 
 
+class TestReadFileAttachedFileNote:
+    """A missing read_file path named like one of the user's attachments says
+    where that file is, instead of a bare "not found" that invites the model
+    to keep searching or to create the file."""
+
+    _NOTE = (
+        "The user attached a file named 'notes.md' to a message in this "
+        "conversation. Attachments are not saved to disk, so use the "
+        "attachment in that message instead of the filesystem."
+    )
+
+    def _session_with_attachment(self, filename: str) -> ChatSession:
+        session = _make_session()
+        session.messages.append(
+            turn_from_dict(
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "summarize it"},
+                        {"type": "document", "attachment_id": "a1"},
+                    ],
+                    "_attachments_meta": [
+                        {
+                            "attachment_id": "a1",
+                            "kind": "text",
+                            "filename": filename,
+                            "mime_type": "text/markdown",
+                            "size_bytes": 4,
+                        }
+                    ],
+                }
+            )
+        )
+        return session
+
+    def _read(self, session: ChatSession, path: str) -> Any:
+        item = {"call_id": "c1", "path": path, "offset": None, "limit": None}
+        return session._exec_read_file(item)[1]
+
+    def test_missing_path_named_like_an_attachment_points_at_it(self, tmp_db, tmp_path):
+        session = self._session_with_attachment("notes.md")
+        path = str(tmp_path / "notes.md")
+        assert self._read(session, path) == f"Error: {path} not found. {self._NOTE}"
+
+    def test_the_name_matches_case_insensitively_in_any_directory(self, tmp_db, tmp_path):
+        session = self._session_with_attachment("notes.md")
+        assert self._read(session, str(tmp_path / "docs" / "NOTES.md")).endswith(self._NOTE)
+
+    def test_a_name_no_attachment_carries_keeps_the_plain_error(self, tmp_db, tmp_path):
+        session = self._session_with_attachment("notes.md")
+        path = str(tmp_path / "other.md")
+        assert self._read(session, path) == f"Error: {path} not found"
+
+    def test_an_existing_file_of_that_name_still_reads(self, tmp_db, tmp_path):
+        (tmp_path / "notes.md").write_text("on disk\n")
+        session = self._session_with_attachment("notes.md")
+        assert "on disk" in self._read(session, str(tmp_path / "notes.md"))
+
+    def test_other_read_errors_carry_no_note(self, tmp_db, tmp_path):
+        (tmp_path / "notes.md").write_bytes(b"\x00binary")
+        session = self._session_with_attachment("notes.md")
+        output = self._read(session, str(tmp_path / "notes.md"))
+        assert "binary file" in output
+        assert "attached" not in output
+
+    @pytest.mark.parametrize("vision", [True, False])
+    def test_a_missing_image_named_like_an_attachment_points_at_it(self, tmp_db, tmp_path, vision):
+        session = self._session_with_attachment("shot.png")
+        caps = MagicMock()
+        caps.supports_vision = vision
+        replace_session_lane(session, capabilities=caps)
+        output = self._read(session, str(tmp_path / "shot.png"))
+        assert output.endswith(self._NOTE.replace("notes.md", "shot.png"))
+
+
 class TestGetCapabilitiesOverride:
     """Test _get_capabilities with config.toml overrides."""
 

@@ -473,3 +473,22 @@ def unreadable_placeholder(filename: str) -> dict[str, Any]:
         "type": "text",
         "text": f"[unreadable attachment: {safe_attachment_label(filename, default='attachment')}]",
     }
+
+
+def attached_file_label(filename: str) -> dict[str, Any]:
+    """Return the text part that introduces an attached text file on the wire.
+
+    The document part carries the bytes, but nothing in it tells a model that
+    this is the file the user means by its name or by "the attached document",
+    nor that the file exists nowhere else.  Small models then look for the
+    name with ``read_file`` / ``search`` and, finding nothing, offer to create
+    it.  This label states both facts once per attachment, ahead of the part.
+    """
+    name = safe_attachment_label(filename, default="attachment")
+    return {
+        "type": "text",
+        "text": (
+            f"[Attached file '{name}' — its full contents follow; "
+            "attachments are not saved to disk]"
+        ),
+    }

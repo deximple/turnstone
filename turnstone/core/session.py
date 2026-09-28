@@ -49,6 +49,7 @@ from turnstone.core.attachments import (
 from turnstone.core.attachments import (
     PDF_SIZE_CAP,
     Attachment,
+    attached_file_label,
     neutralize_attachment_part,
     neutralize_untrusted_fences,
     safe_attachment_label,
@@ -8277,7 +8278,13 @@ class ChatSession:
                 cancel_ref=cancel_ref,
                 principal_id=principal_id,
             )
-        return attachment_to_content_part(att)
+        part = attachment_to_content_part(att)
+        if kind == "text" and part is not None and part.get("type") == "document":
+            # Text blobs come only from user attachments.  Name the file and
+            # say it is not on disk, so the model reads this copy instead of
+            # hunting for the name in the workspace.
+            return [attached_file_label(att.get("filename") or ""), part]
+        return part
 
     def _audio_fallback_part(
         self,
@@ -25009,6 +25016,35 @@ class ChatSession:
         except Exception as e:
             return [], resolved, f"Error reading {path}: {e}"
 
+    def _attached_file_note(self, path: str) -> str:
+        """Explain a missing *path* whose name matches one of the user's attachments.
+
+        Attachments reach the model inside the user's message and are never
+        written to disk, yet a model asked about "notes.md" may go looking for
+        it with ``read_file``.  The bare "not found" invites it to keep
+        searching or to create the file; naming the attachment lets it
+        correct course.  Empty when no attachment in the live history has
+        this file name (case-insensitive).
+        """
+        name = os.path.basename(path).casefold()
+        if not name:
+            return ""
+        for turn in reversed(self.messages):
+            if turn.role is not Role.USER:
+                continue
+            for meta in turn.meta.extra.get("attachments_meta") or ():
+                if not isinstance(meta, dict):
+                    continue
+                filename = os.path.basename(str(meta.get("filename") or ""))
+                if filename.casefold() == name:
+                    label = safe_attachment_label(filename)
+                    return (
+                        f". The user attached a file named '{label}' to a message in this "
+                        "conversation. Attachments are not saved to disk, so use the "
+                        "attachment in that message instead of the filesystem."
+                    )
+        return ""
+
     def _exec_read_file(self, item: dict[str, Any]) -> tuple[str, str | list[dict[str, Any]]]:
         """Read a file and return numbered lines, or image content parts."""
         call_id, path = item["call_id"], item["path"]
@@ -25024,6 +25060,8 @@ class ChatSession:
         all_lines, _, err = self._read_text_lines(path)
         if err:
             self._current_read_files.discard(resolved)
+            if not os.path.exists(resolved):
+                err += self._attached_file_note(path)
             self._report_tool_result(call_id, "read_file", err, is_error=True)
             return call_id, err
 
@@ -25061,6 +25099,8 @@ class ChatSession:
             except OSError as e:
                 self._current_read_files.discard(resolved)
                 msg = f"Error: {path}: {e}"
+                if not os.path.exists(resolved):
+                    msg += self._attached_file_note(path)
                 self._report_tool_result(call_id, "read_file", msg, is_error=True)
                 return call_id, msg
             self._current_read_files.add(resolved)
@@ -25076,7 +25116,7 @@ class ChatSession:
                 raw = f.read()
         except FileNotFoundError:
             self._current_read_files.discard(resolved)
-            msg = f"Error: {path} not found"
+            msg = f"Error: {path} not found" + self._attached_file_note(path)
             self._report_tool_result(call_id, "read_file", msg, is_error=True)
             return call_id, msg
         except Exception as e:
