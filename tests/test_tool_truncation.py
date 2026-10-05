@@ -815,16 +815,16 @@ class TestAutomaticBashDrain:
 
     def test_recut_is_skipped_when_the_marker_is_not_unique(self, session):
         """A rendering whose text no longer locates the drain's marker exactly
-        once (a one-character fallback marker the source also contains) passes
+        once (the guard duplicated the rendering) passes
         as the guard left it rather than being split at the wrong place."""
         session._judge_config = JudgeConfig(output_guard=True, output_guard_llm=False)
         session.tool_truncation = 60
         session._manual_tool_truncation = True
-        source = "token=SECRET … " + "x" * 200
+        source = "token=SECRET " + "x" * 100_000
         calls = [{"id": "tc_e", "function": {"name": "read_file", "arguments": "{}"}}]
 
         def guard(_call_id, text, *_args, **_kwargs):
-            return text.replace("SECRET", "[REDACTED:secret]"), None
+            return text.replace("SECRET", "[REDACTED:secret]") * 2, None
 
         with _send_with_tool_batch(
             session,
@@ -837,8 +837,8 @@ class TestAutomaticBashDrain:
             session.send("go")
 
         (text,) = _tool_turn_texts(session)
-        assert text.startswith("token=[REDACTED:secret] …")
-        assert text.count("…") == 2 and len(text) > 60
+        assert text.startswith("token=[REDACTED:secret] ")
+        assert text.count("chars truncated") == 2 and len(text) > 60
 
     def test_bash_output_read_is_bounded_by_the_running_budget_in_manual_mode(self, session):
         """An operator cap is uniform, but the fold still applies the running

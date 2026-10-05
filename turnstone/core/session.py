@@ -1702,6 +1702,9 @@ _LEADING_JSON_RE = re.compile(r"\s*[\[{]")
 # place a main-session result is cut, so its omission marker always reports
 # the producer's real output size.
 _TOOL_RESULT_SHARE: float = 0.20
+# Scan past both fold boundaries by one task-agent clip width, enough to
+# include credentials that would otherwise reach the model only as fragments.
+_TOOL_RESULT_GUARD_MARGIN_CHARS: int = _AGENT_TOOL_OUTPUT_CAP
 
 # Tools whose executor consumed the result's source in producing it, so a
 # dropped result could never be re-read: their cut carries the consumed
@@ -6217,15 +6220,15 @@ class ChatSession:
     def _executor_capture_chars(self) -> int:
         """Characters a streaming executor retains at each edge of its output.
 
-        Half the session cap, rounded up, so the two edges together can render
-        any cap the result fold applies on this session and the fold stays the
-        single cut at every size while a capture never holds more than a fold
-        here could show; and never less than a task agent's guard window, so
-        an agent's head clip is never narrower than the window it was guarded
-        over.
+        Half the session cap, rounded up, plus the fold's guard margin, so
+        both cut boundaries can be scanned before the final cut; and never
+        less than a task agent's guard window.
         """
 
-        return max((self.tool_truncation + 1) // 2, _AGENT_GUARD_WINDOW_CHARS)
+        return max(
+            (self.tool_truncation + 1) // 2 + _TOOL_RESULT_GUARD_MARGIN_CHARS,
+            _AGENT_GUARD_WINDOW_CHARS,
+        )
 
     def _bounded_result(self, output: str) -> str:
         """``output`` with at most the executor retention held at each edge.
@@ -13112,12 +13115,10 @@ class ChatSession:
                 _tc_args = {c["id"]: c.get("function", {}).get("arguments", "") for c in tool_calls}
                 _last_idx = len(results) - 1
 
-                # Pre-truncate (cp-2): the LLM judge stage must see the
-                # same text that lands in the assistant's context, not the
-                # full pre-truncation blob.  Otherwise a fat web_fetch can
-                # OOM the judge model or burn tokens on content that won't
-                # even reach the assistant.  Truncation is a safety
-                # invariant that runs regardless of the guard stage.
+                # Bound the guard's input, retaining a margin past both cut
+                # boundaries so credentials straddling them are seen whole.
+                # The post-guard cut restores the admission's real cap.
+                # Truncation runs regardless of the guard stage.
                 #
                 # The remaining-token budget shrinks as each output is sized;
                 # without per-output bookkeeping, N parallel tool results
@@ -13205,10 +13206,11 @@ class ChatSession:
                 # result and remains the aggregate hard backstop.
                 batch_truncation_budget = truncation_budget
                 # Per-result admission records for the post-guard re-cut: the
-                # drain's rendering and its coverage.  The executor's complete
+                # guard rendering, its coverage and the real cap (zero for
+                # results admitted whole).  The executor's complete
                 # result is released here rather than held across the guard's
                 # judge round trips.
-                _admissions: dict[str, TruncationResult] = {}
+                _admissions: dict[str, tuple[TruncationResult, int]] = {}
                 maximum = self._tool_result_truncation_limit(
                     batch_budget_tokens=batch_truncation_budget
                 )
@@ -13216,7 +13218,7 @@ class ChatSession:
                 def _admit_batch(
                     names: dict[str, Any],
                     cap: int,
-                    admissions: dict[str, TruncationResult],
+                    admissions: dict[str, tuple[TruncationResult, int]],
                 ) -> None:
                     # A helper so no executor result outlives its admission
                     # in a loop variable while the guard's judge round trips
@@ -13237,12 +13239,19 @@ class ChatSession:
                                 maximum_chars=cap,
                                 verbatim_pool=verbatim_pool,
                             )
-                            admissions[tc_id] = truncation
+                            real_cap = truncation.limit_chars if truncation.truncated else 0
                             truncation_budget = max(
                                 0,
                                 truncation_budget
                                 - math.ceil(len(truncation.text) / self._chars_per_token),
                             )
+                            if real_cap > 0 and self._judge_cfg and self._judge_cfg.output_guard:
+                                truncation = truncate_text(
+                                    output,
+                                    real_cap + 2 * _TOOL_RESULT_GUARD_MARGIN_CHARS,
+                                    marker_factory=_result_marker_factory(names.get(tc_id, "")),
+                                )
+                            admissions[tc_id] = truncation, real_cap
                             output = truncation.text
                         admitted.append((tc_id, output))
                     results = admitted
@@ -13322,26 +13331,37 @@ class ChatSession:
                     self._check_cancelled(my_generation)
                     guarded_results.append((_ri, tc_id, output, assessment))
 
-                # Redaction can lengthen a cut result past its cap: a short
-                # secret becomes a longer marker.  Such a result is cut again
-                # at the drain's limit by splitting the guarded rendering at
-                # the drain's marker and re-rendering the two edges, so the
-                # second cut never runs into the first marker and the omitted
-                # count still includes the middle the drain removed.  A result
-                # the guard left alone, one the drain admitted whole, or one
+                # Cut the guarded window to the admission's real cap.  Split
+                # a lossy window at its marker and re-render the guarded edges
+                # so the omitted count still includes the removed middle.
+                # A window that held the whole source can be cut directly.
+                # A result the drain admitted whole, or one
                 # whose text no longer locates the marker exactly once passes
                 # as the guard left it: what the guard produced is what the
                 # model sees, and the pre-send hard-compaction guard remains
                 # the backstop for a batch that grew past its allowance.
                 recut: list[tuple[int, str, Any, OutputAssessment | None]] = []
                 for _ri, tc_id, output, assessment in guarded_results:
-                    rendered = _admissions.get(tc_id)
+                    admission = _admissions.get(tc_id)
+                    if admission is None:
+                        recut.append((_ri, tc_id, output, assessment))
+                        continue
+                    rendered, real_cap = admission
                     if (
-                        rendered is not None
-                        and isinstance(output, str)
-                        and rendered.truncated
-                        and rendered.limit_chars > 0
-                        and len(output) > rendered.limit_chars
+                        isinstance(output, str)
+                        and real_cap > 0
+                        and len(output) > real_cap
+                        and not rendered.truncated
+                    ):
+                        output = truncate_text(
+                            output,
+                            real_cap,
+                            marker_factory=_result_marker_factory(_tc_names.get(tc_id, "")),
+                        ).text
+                    elif (
+                        isinstance(output, str)
+                        and real_cap > 0
+                        and len(output) > real_cap
                         and output.count(rendered.marker) == 1
                     ):
                         head, _marker, tail = output.partition(rendered.marker)
@@ -13350,7 +13370,7 @@ class ChatSession:
                                 head, tail, len(head) + len(tail) + rendered.omitted_chars
                             )
                             .render(
-                                rendered.limit_chars,
+                                real_cap,
                                 marker_factory=_result_marker_factory(_tc_names.get(tc_id, "")),
                             )
                             .text
