@@ -438,6 +438,32 @@ def _policy(*, owed: bool = False, over_soft: bool = False, over_hard: bool = Fa
 
 
 class TestAutomaticBashDrain:
+    def test_guard_redacts_private_key_straddling_the_tail_cut(self, session):
+        session._judge_config = JudgeConfig(output_guard=True, output_guard_llm=False)
+        session.tool_truncation = 1000
+        session._manual_tool_truncation = True
+        pem = (
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            + ("MIIEow" * 40 + "\n") * 25
+            + "-----END RSA PRIVATE KEY-----\n"
+        )
+        output = "z" * 100_000 + pem
+        calls = [{"id": "tc_key", "function": {"name": "read_file", "arguments": "{}"}}]
+
+        with _send_with_tool_batch(
+            session,
+            calls,
+            [("tc_key", output)],
+            _remaining_token_budget=MagicMock(return_value=10_000),
+        ):
+            session.send("go")
+
+        (text,) = _tool_turn_texts(session)
+        assert "MIIEow" not in text
+        assert "[REDACTED:private_key]" in text
+        assert len(text) <= session.tool_truncation
+        assert text.count("chars truncated") == 1
+
     def test_parallel_bash_results_share_one_remaining_budget_snapshot(self, session):
         output = "BEGIN\n" + "middle\n" * 5000 + "END\n"
         calls = [
